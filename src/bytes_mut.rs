@@ -1216,6 +1216,256 @@ impl BytesMut {
             slice::from_raw_parts_mut(ptr.cast(), len)
         }
     }
+
+    /// Opens a protected window into the buffer.
+    ///
+    /// The returned [`Window`] borrows the buffer for its lifetime. While the
+    /// window is open, bytes borrowed from it are guaranteed **not** to be
+    /// moved, compacted, or overwritten: the window refuses any write that
+    /// would reallocate or compact the underlying buffer.
+    ///
+    /// See [`Window`] for the full semantics.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bytes::{BytesMut, BufMut};
+    ///
+    /// let mut buf = BytesMut::with_capacity(6);
+    /// buf.put_slice(b"ab");
+    ///
+    /// let win = buf.window();
+    /// assert_eq!(win.chunk(), b"ab");
+    /// ```
+    ///
+    /// Growth cannot happen while the window borrows the buffer:
+    ///
+    /// ```compile_fail
+    /// use bytes::BytesMut;
+    ///
+    /// let mut buf = BytesMut::with_capacity(6);
+    /// let win = buf.window();
+    /// // The window exclusively borrows `buf`, so it cannot be grown here:
+    /// buf.reserve(10);
+    /// ```
+    #[inline]
+    pub fn window(&mut self) -> Window<'_> {
+        Window { buf: self }
+    }
+}
+
+/// A protected, writable view into a [`BytesMut`].
+///
+/// `Window` is returned by [`BytesMut::window`] and borrows the buffer for the
+/// duration of the window. While the window is open, bytes borrowed from it
+/// (via [`chunk`](Window::chunk)) are guaranteed **not** to be moved,
+/// compacted, or overwritten: the window refuses any write that would
+/// reallocate or compact the underlying buffer.
+///
+/// This makes it safe to hand out `&[u8]` slices for parsing and then append
+/// more bytes to the buffer without invalidating those slices. Pointer
+/// stability is provided explicitly by the window; it is not inferred from
+/// the buffer happening to have sufficient capacity.
+///
+/// # Committing and dropping
+///
+/// Use [`commit`](Window::commit) to release a confirmed prefix of the borrowed
+/// bytes. The unread suffix is retained and becomes the new readable window.
+///
+/// If the window is dropped without being committed, no bytes are consumed:
+/// the buffer retains all of its data.
+///
+/// # Capacity
+///
+/// Writes that would exceed the buffer's existing spare capacity are rejected
+/// (panic) before any bytes are written. The window never reallocates or
+/// compacts, so growth can only happen once the window is dropped (and the
+/// exclusive borrow of the buffer ends), preserving Rust's borrowing
+/// boundaries.
+///
+/// # Examples
+///
+/// ```
+/// use bytes::{BytesMut, BufMut};
+///
+/// let mut buf = BytesMut::with_capacity(6);
+/// buf.put_slice(b"ab");
+///
+/// let mut win = buf.window();
+///
+/// // Borrow the parsed prefix. The returned slice is stable: it will not be
+/// // moved or overwritten while the window is open.
+/// let parsed = win.chunk();
+/// assert_eq!(parsed, b"ab");
+///
+/// // Append more bytes. This does not invalidate `parsed`.
+/// win.put_slice(b"cd");
+/// assert_eq!(parsed, b"ab");
+/// assert_eq!(win.chunk(), b"abcd");
+///
+/// // Commit the confirmed prefix. The unread suffix (`cd`) is retained.
+/// win.commit(2);
+/// assert_eq!(win.chunk(), b"cd");
+///
+/// // Dropping the window without committing leaves the data intact.
+/// drop(win);
+/// assert_eq!(&buf[..], b"cd");
+/// ```
+pub struct Window<'a> {
+    buf: &'a mut BytesMut,
+}
+
+impl<'a> Window<'a> {
+    /// Returns the readable bytes of the window.
+    ///
+    /// The returned slice borrows from the underlying [`BytesMut`] for the
+    /// lifetime of the buffer borrow (not just `&self`), so it remains valid
+    /// across writes performed through the window. The window guarantees that
+    /// these bytes are not moved, compacted, or overwritten before they are
+    /// committed or the window is dropped.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bytes::{BytesMut, BufMut};
+    ///
+    /// let mut buf = BytesMut::with_capacity(6);
+    /// buf.put_slice(b"ab");
+    ///
+    /// let win = buf.window();
+    /// assert_eq!(win.chunk(), b"ab");
+    /// ```
+    #[inline]
+    pub fn chunk(&self) -> &'a [u8] {
+        // SAFETY: `self.buf` is exclusively borrowed for `'a`, and the window
+        // guarantees that the readable prefix `[0, len)` is not moved,
+        // compacted, or overwritten while the window is open. Writes performed
+        // through the window only touch the spare capacity `[len, cap)`, which
+        // is disjoint from the bytes returned here.
+        unsafe { slice::from_raw_parts(self.buf.ptr.as_ptr(), self.buf.len) }
+    }
+
+    /// Returns the number of readable bytes in the window.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bytes::{BytesMut, BufMut};
+    ///
+    /// let mut buf = BytesMut::with_capacity(6);
+    /// buf.put_slice(b"ab");
+    ///
+    /// let win = buf.window();
+    /// assert_eq!(win.remaining(), 2);
+    /// ```
+    #[inline]
+    pub fn remaining(&self) -> usize {
+        self.buf.len
+    }
+
+    /// Returns the number of bytes that can be written to the window without
+    /// reallocating or compacting.
+    ///
+    /// This is the buffer's existing spare capacity. Writes larger than this
+    /// are rejected (panic) before any bytes are written.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bytes::{BytesMut, BufMut};
+    ///
+    /// let mut buf = BytesMut::with_capacity(6);
+    /// buf.put_slice(b"ab");
+    ///
+    /// let win = buf.window();
+    /// assert_eq!(win.remaining_mut(), 4);
+    /// ```
+    #[inline]
+    pub fn remaining_mut(&self) -> usize {
+        self.buf.cap - self.buf.len
+    }
+
+    /// Releases a confirmed prefix of the window.
+    ///
+    /// `n` is the number of bytes at the start of the window that have been
+    /// confirmed and can be discarded. The unread suffix is retained and
+    /// becomes the new readable window.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n` is greater than the number of readable bytes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bytes::{BytesMut, BufMut};
+    ///
+    /// let mut buf = BytesMut::with_capacity(6);
+    /// buf.put_slice(b"abcd");
+    ///
+    /// let mut win = buf.window();
+    /// win.commit(2);
+    /// assert_eq!(win.chunk(), b"cd");
+    /// ```
+    #[inline]
+    pub fn commit(&mut self, n: usize) {
+        self.buf.advance(n);
+    }
+}
+
+// The `BufMut` implementation for `Window` writes only into the existing
+// spare capacity and never reallocates or compacts. This is what guarantees
+// the stability of slices handed out by [`Window::chunk`].
+unsafe impl<'a> BufMut for Window<'a> {
+    #[inline]
+    fn remaining_mut(&self) -> usize {
+        self.buf.cap - self.buf.len
+    }
+
+    #[inline]
+    fn chunk_mut(&mut self) -> &mut UninitSlice {
+        // Hand out the existing spare capacity directly. We deliberately do
+        // *not* call `self.buf.chunk_mut()` here, because that may reserve more
+        // capacity when the buffer is full, which would move the buffer and
+        // invalidate slices handed out by `Window::chunk`.
+        unsafe {
+            let ptr = self.buf.ptr.as_ptr();
+            let len = self.buf.len;
+            let cap = self.buf.cap;
+            UninitSlice::from_raw_parts_mut(ptr.add(len), cap - len)
+        }
+    }
+
+    #[inline]
+    unsafe fn advance_mut(&mut self, cnt: usize) {
+        let remaining = self.buf.cap - self.buf.len;
+        if cnt > remaining {
+            super::panic_advance(&TryGetError {
+                requested: cnt,
+                available: remaining,
+            });
+        }
+        // SAFETY: The caller (via the `BufMut` contract) guarantees that the
+        // next `cnt` bytes of the spare capacity have been initialized. We
+        // only update the length; we never touch already-initialized bytes.
+        self.buf.len += cnt;
+    }
+}
+
+impl<'a> Drop for Window<'a> {
+    fn drop(&mut self) {
+        // Dropping the window without committing leaves all data intact. The
+        // exclusive borrow of the buffer ends here; no bytes are moved,
+        // compacted, or overwritten.
+    }
+}
+
+impl<'a> fmt::Debug for Window<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Window")
+            .field("buf", &self.buf)
+            .finish()
+    }
 }
 
 impl Drop for BytesMut {
