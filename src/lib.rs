@@ -83,8 +83,10 @@ mod bytes;
 mod bytes_mut;
 mod fmt;
 mod loom;
+pub mod range_plan;
 pub use crate::bytes::Bytes;
 pub use crate::bytes_mut::BytesMut;
+pub use crate::range_plan::{RangePlan, RangePlanError, RangePlanErrorKind};
 
 // Optional Serde support
 #[cfg(feature = "serde")]
