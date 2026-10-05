@@ -872,6 +872,74 @@ impl BytesMut {
         self.reserve_inner(additional, false)
     }
 
+    /// Opens an explicit protection window over the unread bytes of this
+    /// `BytesMut`.
+    ///
+    /// While the returned [`ParseWindow`] guard is alive it holds the unique
+    /// (`&mut`) borrow of the buffer, so the parse bytes borrowed inside the
+    /// window cannot be compacted, reclaimed, or overwritten by `reserve`,
+    /// `try_reclaim`, or unrelated writes. This is enforced by the Rust
+    /// borrow checker instead of assuming that "enough capacity" keeps
+    /// pointers stable.
+    ///
+    /// Appending while the window is open must go through
+    /// [`ParseWindow::try_write`], which never moves or overwrites the
+    /// protected bytes: if the write does not fit in the spare capacity it
+    /// is rejected *before* anything is written, and the caller must close
+    /// the window, grow the buffer, and open a new window. Growth therefore
+    /// always happens outside of the window's borrow boundary.
+    ///
+    /// Confirmed bytes are released with [`ParseWindow::commit`], which only
+    /// frees the confirmed prefix; the unconfirmed suffix is retained.
+    /// Dropping the guard without committing abandons the window and keeps
+    /// all of the buffered data intact.
+    ///
+    /// # Examples
+    ///
+    /// A six byte session: read `ab`, append `cd` and `ef` through the
+    /// window, then commit the confirmed prefix.
+    ///
+    /// ```
+    /// use bytes::BytesMut;
+    ///
+    /// let mut buf = BytesMut::with_capacity(8);
+    /// buf.extend_from_slice(b"ab");
+    ///
+    /// {
+    ///     let mut win = buf.window();
+    ///     assert_eq!(win.parsed(), b"ab");
+    ///
+    ///     // Appending through the window never overwrites the protected
+    ///     // bytes, so "ab" is still intact after writing "cd" and "ef".
+    ///     win.try_write(b"cd").unwrap();
+    ///     win.try_write(b"ef").unwrap();
+    ///     assert_eq!(win.parsed(), b"abcdef");
+    ///
+    ///     // Only the confirmed prefix is released; the unconfirmed suffix
+    ///     // stays protected.
+    ///     win.commit(2);
+    ///     assert_eq!(win.parsed(), b"cdef");
+    /// } // Dropping the window keeps the uncommitted bytes.
+    ///
+    /// assert_eq!(&buf[..], b"cdef");
+    /// ```
+    ///
+    /// Growing the buffer while a window is open is rejected by the borrow
+    /// checker:
+    ///
+    /// ```compile_fail
+    /// use bytes::BytesMut;
+    ///
+    /// let mut buf = BytesMut::from(&b"ab"[..]);
+    /// let win = buf.window();
+    /// buf.reserve(64); // ERROR: `buf` is mutably borrowed by the window
+    /// drop(win);
+    /// ```
+    #[inline]
+    pub fn window(&mut self) -> ParseWindow<'_> {
+        ParseWindow { buf: self }
+    }
+
     /// Appends given bytes to this `BytesMut`.
     ///
     /// If this `BytesMut` object does not have enough capacity, it is resized
@@ -1217,6 +1285,178 @@ impl BytesMut {
         }
     }
 }
+
+/*
+ *
+ * ===== ParseWindow =====
+ *
+ */
+
+/// An explicit protection window over the unread bytes of a [`BytesMut`].
+///
+/// Created by [`BytesMut::window`]; see that method for an overview.
+///
+/// The guard holds the unique borrow of the buffer for its whole lifetime,
+/// so while it is alive the parse bytes borrowed through
+/// [`parsed`](ParseWindow::parsed) cannot be compacted or overwritten by
+/// the buffer. All interaction goes through the guard:
+///
+/// * [`parsed`](ParseWindow::parsed) borrows the not-yet-committed bytes.
+/// * [`try_write`](ParseWindow::try_write) appends without moving or
+///   overwriting the protected bytes and rejects writes that would exceed
+///   the spare capacity *before* anything is written.
+/// * [`commit`](ParseWindow::commit) releases the confirmed prefix only;
+///   the unconfirmed suffix is retained.
+///
+/// Dropping the guard without committing abandons the window and, as
+/// documented, keeps all of the buffered data intact.
+#[derive(Debug)]
+pub struct ParseWindow<'a> {
+    buf: &'a mut BytesMut,
+}
+
+impl<'a> ParseWindow<'a> {
+    /// Returns the bytes currently protected by the window.
+    ///
+    /// These are the bytes that were borrowed for parsing and have not been
+    /// confirmed with [`commit`](ParseWindow::commit) yet. The returned
+    /// slice borrows the window, so it cannot be held across a `commit` or
+    /// `try_write` call; the borrow checker enforces that boundary.
+    #[inline]
+    pub fn parsed(&self) -> &[u8] {
+        // A plain safe reborrow of the buffer's initialized bytes; no
+        // unsafe pointer manipulation is involved.
+        &self.buf[..]
+    }
+
+    /// Returns the number of bytes currently protected by the window.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Returns `true` if the window protects no bytes.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    /// Returns the number of bytes that can still be written through the
+    /// window without growing the buffer.
+    #[inline]
+    pub fn remaining_capacity(&self) -> usize {
+        self.buf.capacity() - self.buf.len()
+    }
+
+    /// Confirms the first `cnt` protected bytes and releases them.
+    ///
+    /// Only the confirmed prefix is released: the start of the buffer view
+    /// is advanced past it, so the space becomes reclaimable by later
+    /// writes once the window is closed. The unconfirmed suffix is
+    /// retained and stays protected by the window.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `cnt` is greater than the number of protected bytes.
+    #[inline]
+    pub fn commit(&mut self, cnt: usize) {
+        assert!(
+            cnt <= self.buf.len(),
+            "cannot commit past the protected bytes: {:?} <= {:?}",
+            cnt,
+            self.buf.len(),
+        );
+        // Advancing only moves the start of the view; it never touches the
+        // bytes that remain in the window.
+        self.buf.advance(cnt);
+    }
+
+    /// Appends `bytes` to the buffer without moving or overwriting the
+    /// protected bytes.
+    ///
+    /// The write only uses the spare capacity that is already available; it
+    /// never reallocates or compacts, so the protected bytes keep their
+    /// address and contents. If `bytes` does not fit in the spare capacity,
+    /// the write is rejected *before* anything is written and the buffer is
+    /// left unchanged. To grow the buffer, close the window, reserve, and
+    /// open a new window.
+    ///
+    /// On success, returns the number of bytes written, which is always
+    /// `bytes.len()`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bytes::BytesMut;
+    ///
+    /// let mut buf = BytesMut::with_capacity(4);
+    /// buf.extend_from_slice(b"ab");
+    ///
+    /// let mut win = buf.window();
+    /// assert_eq!(win.remaining_capacity(), 2);
+    ///
+    /// // Does not fit: rejected before anything is written.
+    /// assert!(win.try_write(b"cdef").is_err());
+    /// assert_eq!(win.parsed(), b"ab");
+    ///
+    /// // Fits in the spare capacity: appended after the protected bytes.
+    /// win.try_write(b"cd").unwrap();
+    /// assert_eq!(win.parsed(), b"abcd");
+    /// ```
+    #[inline]
+    pub fn try_write(&mut self, bytes: &[u8]) -> Result<usize, WindowWriteError> {
+        let available = self.remaining_capacity();
+        if bytes.len() > available {
+            return Err(WindowWriteError {
+                requested: bytes.len(),
+                available,
+            });
+        }
+        // There is enough spare capacity, so this cannot reallocate,
+        // compact, or otherwise disturb the protected bytes.
+        self.buf.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+}
+
+/// Error returned by [`ParseWindow::try_write`] when the bytes do not fit
+/// in the spare capacity of the protected buffer.
+///
+/// The write is rejected before anything is written. Close the window,
+/// grow the buffer (for example with [`BytesMut::reserve`]), and open a new
+/// window to retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowWriteError {
+    requested: usize,
+    available: usize,
+}
+
+impl WindowWriteError {
+    /// Returns the number of bytes the rejected write tried to append.
+    #[inline]
+    pub fn requested(&self) -> usize {
+        self.requested
+    }
+
+    /// Returns the spare capacity that was available to the window.
+    #[inline]
+    pub fn available(&self) -> usize {
+        self.available
+    }
+}
+
+impl fmt::Display for WindowWriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "not enough spare capacity to write through the protection window (requested {} but only {} available)",
+            self.requested, self.available
+        )
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for WindowWriteError {}
 
 impl Drop for BytesMut {
     fn drop(&mut self) {
