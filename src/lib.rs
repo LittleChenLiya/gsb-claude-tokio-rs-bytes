@@ -78,6 +78,8 @@ extern crate std;
 
 pub mod buf;
 pub use crate::buf::{Buf, BufMut};
+pub mod range_views;
+pub use crate::range_views::{RangeError, RangeViews};
 
 mod bytes;
 mod bytes_mut;
