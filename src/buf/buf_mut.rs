@@ -1,4 +1,4 @@
-use crate::buf::{limit, Chain, Limit, UninitSlice};
+use crate::buf::{limit, try_limit, Chain, Limit, TryLimit, UninitSlice};
 #[cfg(feature = "std")]
 use crate::buf::{writer, Writer};
 use crate::{panic_advance, panic_does_not_fit, TryGetError};
@@ -1287,6 +1287,48 @@ pub unsafe trait BufMut {
         Self: Sized,
     {
         limit::new(self, limit)
+    }
+
+    /// Creates an adaptor which can write at most `limit` bytes to `self`,
+    /// borrowing `self` for the lifetime of the adaptor.
+    ///
+    /// Unlike [`limit`](BufMut::limit), the returned adaptor borrows the
+    /// underlying buffer instead of consuming it, so the buffer can be used
+    /// again once the adaptor is dropped. In addition to the infallible
+    /// [`BufMut`] interface (which panics on overflow, exactly like
+    /// [`Limit`]), the adaptor provides
+    /// [`try_put_slice`](TryLimit::try_put_slice), which rejects a single
+    /// write that would exceed the remaining limit instead of panicking,
+    /// without partially advancing the cursor.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bytes::{BufMut, TryPutError};
+    ///
+    /// let mut buf = Vec::with_capacity(16);
+    ///
+    /// {
+    ///     let mut dst = buf.try_limit(4);
+    ///     dst.try_put_slice(b"ab").unwrap();
+    ///     dst.try_put_slice(b"cd").unwrap();
+    ///     assert_eq!(0, dst.remaining_mut());
+    ///     assert_eq!(
+    ///         Err(TryPutError { requested: 1, available: 0 }),
+    ///         dst.try_put_slice(b"e"),
+    ///     );
+    /// } // The adaptor is dropped here, releasing the borrow.
+    ///
+    /// assert_eq!(buf, b"abcd");
+    /// buf.put_slice(b"ef");
+    /// assert_eq!(buf, b"abcdef");
+    /// ```
+    #[inline]
+    fn try_limit(&mut self, limit: usize) -> TryLimit<'_, Self>
+    where
+        Self: Sized,
+    {
+        try_limit::new(self, limit)
     }
 
     /// Creates an adaptor which implements the `Write` trait for `self`.
