@@ -11,7 +11,7 @@ use alloc::{
     vec::Vec,
 };
 
-use crate::buf::IntoIter;
+use crate::buf::{BytesCursor, IntoIter};
 #[allow(unused)]
 use crate::loom::sync::atomic::AtomicMut;
 use crate::loom::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
@@ -441,6 +441,40 @@ impl Bytes {
         let sub_offset = sub_p - bytes_p;
 
         self.slice(sub_offset..(sub_offset + sub_len))
+    }
+
+    /// Splits this `Bytes` into two independently advanced read cursors.
+    ///
+    /// The returned [`BytesCursor`] pair shares the underlying storage of
+    /// `self` and starts at the same position (the current start of this
+    /// `Bytes`). Neither cursor nor the storage is copied. Both sides can be
+    /// advanced independently (via the [`Buf`] trait) and later merged back
+    /// with [`BytesCursor::merge`] / [`BytesCursor::try_merge`] as long as
+    /// they are the siblings of this fork, are not expired and their
+    /// remaining ranges are compatible.
+    ///
+    /// The original `Bytes` is unaffected: the cursors simply hold additional
+    /// references to the shared storage.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bytes::{Buf, Bytes};
+    ///
+    /// let bytes = Bytes::from_static(b"hello world");
+    /// let (mut left, mut right) = bytes.fork();
+    ///
+    /// left.advance(6);
+    /// right.advance(1);
+    ///
+    /// let merged = left.merge(&mut right);
+    /// assert_eq!(&merged[..], b"world");
+    ///
+    /// // The original buffer is untouched.
+    /// assert_eq!(bytes, b"hello world"[..]);
+    /// ```
+    pub fn fork(&self) -> (BytesCursor, BytesCursor) {
+        BytesCursor::new_pair(self.clone())
     }
 
     /// Splits the bytes into two at the given index.

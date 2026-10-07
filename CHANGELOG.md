@@ -1,3 +1,13 @@
+# Unreleased
+
+### Added
+- Add `Bytes::fork()` which returns two `BytesCursor` values sharing the same
+  storage and initial position. The cursors can be advanced independently and
+  later merged with `BytesCursor::merge` / `BytesCursor::try_merge`, provided
+  they are siblings of the same fork, are not expired and their remaining
+  ranges stay compatible. The merge does not copy the underlying data and
+  leaves both cursors readable when it fails.
+
 # 1.12.1 (July 8th, 2026)
 
 ### Fixed
