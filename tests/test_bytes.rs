@@ -1,6 +1,6 @@
 #![warn(rust_2018_idioms)]
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut, MergeError};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -1820,4 +1820,119 @@ fn bytes_mut_reserve_overflow() {
     b.reserve(usize::MAX - 6);
     // This call relies on the corrupted cap and may cause UB & HBO
     b.put_u8(b'h');
+}
+
+#[test]
+fn fork_merge_advanced_different_lengths() {
+    // Six-byte buffer forked into two cursors sharing the same storage.
+    let bytes = Bytes::from(&b"abcdef"[..]);
+    let (mut a, mut b) = bytes.fork();
+
+    // Advance the two cursors by different lengths.
+    a.advance(1);
+    b.advance(4);
+
+    assert_eq!(a.remaining(), 5);
+    assert_eq!(b.remaining(), 2);
+    assert_eq!(a.chunk(), b"bcdef");
+    assert_eq!(b.chunk(), b"ef");
+    assert!(!a.is_stale());
+    assert!(!b.is_stale());
+
+    // Legal merge: same fork, same initial position, compatible ranges.
+    // The merged handle covers the union of both remaining regions.
+    let merged = a.merge(&mut b).unwrap();
+    assert_eq!(merged.remaining(), 5);
+    assert_eq!(&merged[..], b"bcdef");
+
+    // Merging does not copy: the merged handle points into the original
+    // buffer's storage.
+    assert_eq!(merged.as_ptr(), bytes.as_ptr().wrapping_add(1));
+
+    // A successful merge retires both cursors.
+    assert!(a.is_stale());
+    assert!(b.is_stale());
+}
+
+#[test]
+fn fork_merge_foreign_cursors() {
+    let (mut a, _) = Bytes::from(&b"abcdef"[..]).fork();
+    let (mut c, _) = Bytes::from(&b"abcdef"[..]).fork();
+
+    a.advance(1);
+    c.advance(2);
+
+    // Cursors forked from different buffers are foreign to each other.
+    assert_eq!(a.merge(&mut c), Err(MergeError::Foreign));
+
+    // A failed merge consumes nothing: both cursors remain readable.
+    assert_eq!(a.remaining(), 5);
+    assert_eq!(a.chunk(), b"bcdef");
+    assert_eq!(c.remaining(), 4);
+    assert_eq!(c.chunk(), b"cdef");
+    assert!(!a.is_stale());
+    assert!(!c.is_stale());
+}
+
+#[test]
+fn fork_merge_stale_cursors() {
+    let bytes = Bytes::from(&b"abcdef"[..]);
+    let (mut a, mut b) = bytes.fork();
+
+    a.advance(1);
+    b.advance(4);
+
+    let merged = a.merge(&mut b).unwrap();
+    assert_eq!(&merged[..], b"bcdef");
+
+    // Both cursors are now expired; merging again is rejected.
+    assert_eq!(a.merge(&mut b), Err(MergeError::Stale));
+    assert_eq!(b.merge(&mut a), Err(MergeError::Stale));
+
+    // Stale cursors are still readable and were not consumed by the
+    // failed merges.
+    assert_eq!(a.remaining(), 5);
+    assert_eq!(a.chunk(), b"bcdef");
+    assert_eq!(b.remaining(), 2);
+    assert_eq!(b.chunk(), b"ef");
+}
+
+#[test]
+fn fork_merge_incompatible_positions() {
+    let bytes = Bytes::from(&b"abcdef"[..]);
+    let (mut a, mut b) = bytes.fork();
+
+    a.advance(2);
+
+    // Re-fork `a` at its current position: same storage and fork state,
+    // but a different initial position.
+    let mut child = a.fork();
+    assert_eq!(child.remaining(), 4);
+    assert_eq!(child.chunk(), b"cdef");
+
+    // Same storage, but the initial positions differ, so the remaining
+    // ranges are not merge-compatible.
+    assert_eq!(a.merge(&mut child), Err(MergeError::Incompatible));
+    assert_eq!(child.merge(&mut b), Err(MergeError::Incompatible));
+
+    // Failed merges consume nothing.
+    assert_eq!(a.remaining(), 4);
+    assert_eq!(a.chunk(), b"cdef");
+    assert_eq!(child.remaining(), 4);
+    assert_eq!(child.chunk(), b"cdef");
+    assert_eq!(b.remaining(), 6);
+    assert_eq!(b.chunk(), b"abcdef");
+
+    // The original pair still merges legally afterwards. The merged handle
+    // covers the union of both remaining regions; `b` never advanced, so
+    // the union is the whole buffer.
+    let merged = a.merge(&mut b).unwrap();
+    assert_eq!(&merged[..], b"abcdef");
+    assert_eq!(merged.as_ptr(), bytes.as_ptr());
+}
+
+#[test]
+fn fork_cursor_is_send_sync() {
+    is_sync::<bytes::BytesCursor>();
+    is_send::<bytes::BytesCursor>();
 }

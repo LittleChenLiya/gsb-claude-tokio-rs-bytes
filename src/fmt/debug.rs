@@ -1,7 +1,7 @@
 use core::fmt::{Debug, Formatter, Result};
 
 use super::BytesRef;
-use crate::{Bytes, BytesMut};
+use crate::{Buf, Bytes, BytesCursor, BytesMut};
 
 /// Alternative implementation of `std::fmt::Debug` for byte slice.
 ///
@@ -38,3 +38,13 @@ impl Debug for BytesRef<'_> {
 
 fmt_impl!(Debug, Bytes);
 fmt_impl!(Debug, BytesMut);
+
+impl Debug for BytesCursor {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        f.debug_struct("BytesCursor")
+            .field("remaining", &self.remaining())
+            .field("chunk", &BytesRef(self.chunk()))
+            .field("stale", &self.is_stale())
+            .finish()
+    }
+}

@@ -8,6 +8,7 @@ use alloc::{
     borrow::Borrow,
     boxed::Box,
     string::String,
+    sync::Arc,
     vec::Vec,
 };
 
@@ -625,6 +626,52 @@ impl Bytes {
         }
     }
 
+    /// Forks two cursors that share this buffer's underlying storage.
+    ///
+    /// Both cursors start at the same initial position (the start of this
+    /// buffer's view) and may be advanced independently. While diverged, each
+    /// cursor exposes its own remaining region through the [`Buf`] trait.
+    ///
+    /// Two cursors may be merged back into a single `Bytes` handle with
+    /// [`BytesCursor::merge`] as long as they originate from the same fork,
+    /// have not been retired by a previous merge, started at the same initial
+    /// position, and their remaining regions are compatible. Merging is `O(1)`
+    /// and does not copy the underlying data; the merged handle covers the
+    /// union of both remaining regions.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bytes::{Buf, Bytes};
+    ///
+    /// let bytes = Bytes::from(&b"abcdef"[..]);
+    /// let (mut a, mut b) = bytes.fork();
+    ///
+    /// a.advance(1);
+    /// b.advance(4);
+    ///
+    /// let merged = a.merge(&mut b).unwrap();
+    /// assert_eq!(&merged[..], b"bcdef");
+    /// ```
+    pub fn fork(&self) -> (BytesCursor, BytesCursor) {
+        let state = Arc::new(ForkState {
+            generation: AtomicUsize::new(0),
+        });
+        let init = self.as_ptr() as usize;
+        let end = init + self.len();
+
+        let cursor = |state: &Arc<ForkState>| BytesCursor {
+            bytes: self.clone(),
+            state: state.clone(),
+            init,
+            pos: init,
+            end,
+            generation: 0,
+        };
+
+        (cursor(&state), cursor(&state))
+    }
+
     #[inline]
     pub(crate) unsafe fn with_vtable(
         ptr: *const u8,
@@ -707,6 +754,165 @@ impl Buf for Bytes {
 
     fn copy_to_bytes(&mut self, len: usize) -> Self {
         self.split_to(len)
+    }
+}
+
+// ===== Fork / merge cursor support =====
+
+/// State shared by all cursors originating from a single [`Bytes::fork`]
+/// call.
+///
+/// The generation is bumped every time a merge succeeds, which retires
+/// ("expires") all cursors of that fork without invalidating their ability
+/// to keep reading their remaining bytes.
+struct ForkState {
+    generation: AtomicUsize,
+}
+
+/// A cursor over a shared [`Bytes`] buffer, created by [`Bytes::fork`].
+///
+/// A `BytesCursor` tracks a read position inside the forked buffer without
+/// copying any data. Two cursors that share the same fork state can be
+/// merged back into a single `Bytes` handle with [`BytesCursor::merge`].
+///
+/// The cursor implements [`Buf`], so the remaining bytes can be consumed
+/// with the usual `remaining` / `chunk` / `advance` operations.
+pub struct BytesCursor {
+    /// View of the whole forked range `[init, end)`; keeps the underlying
+    /// storage alive.
+    bytes: Bytes,
+    /// Fork identity shared by mergeable cursors.
+    state: Arc<ForkState>,
+    /// Absolute address of the initial position at fork time.
+    init: usize,
+    /// Absolute address of the current read position.
+    pos: usize,
+    /// Absolute address of the end of the forked range.
+    end: usize,
+    /// Fork generation this cursor belongs to.
+    generation: usize,
+}
+
+/// Error returned when two [`BytesCursor`]s cannot be merged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeError {
+    /// The cursors do not share the same forked storage.
+    Foreign,
+    /// One or both cursors were retired by a previous successful merge.
+    Stale,
+    /// The cursors started at different initial positions or their
+    /// remaining regions are not compatible.
+    Incompatible,
+}
+
+impl fmt::Display for MergeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MergeError::Foreign => f.write_str("cursors do not share the same forked storage"),
+            MergeError::Stale => f.write_str("cursor was retired by a previous merge"),
+            MergeError::Incompatible => {
+                f.write_str("cursors have incompatible positions or remaining ranges")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for MergeError {}
+
+impl BytesCursor {
+    /// Forks a new cursor at this cursor's current position, sharing the
+    /// same underlying storage and fork state.
+    ///
+    /// Because the new cursor starts at a different initial position, it
+    /// cannot be merged with cursors forked at other positions; such a merge
+    /// fails with [`MergeError::Incompatible`].
+    pub fn fork(&self) -> BytesCursor {
+        let offset = self.pos - self.init;
+        BytesCursor {
+            bytes: self.bytes.slice(offset..),
+            state: self.state.clone(),
+            init: self.pos,
+            pos: self.pos,
+            end: self.end,
+            generation: self.generation,
+        }
+    }
+
+    /// Returns `true` if this cursor was retired by a previous successful
+    /// merge and can no longer take part in a merge.
+    ///
+    /// A stale cursor can still read its remaining bytes.
+    pub fn is_stale(&self) -> bool {
+        self.generation != self.state.generation.load(Ordering::Acquire)
+    }
+
+    /// Attempts to merge two cursors back into a single `Bytes` handle.
+    ///
+    /// The merge succeeds only if both cursors:
+    ///
+    /// - originate from the same [`Bytes::fork`] call (otherwise
+    ///   [`MergeError::Foreign`] is returned),
+    /// - have not been retired by a previous merge (otherwise
+    ///   [`MergeError::Stale`] is returned),
+    /// - started at the same initial position and have compatible remaining
+    ///   regions (otherwise [`MergeError::Incompatible`] is returned).
+    ///
+    /// On success the returned handle covers the union of both remaining
+    /// regions without copying the underlying data, and both cursors become
+    /// stale. On failure neither cursor is modified and both remain
+    /// readable.
+    pub fn merge(&mut self, other: &mut BytesCursor) -> Result<Bytes, MergeError> {
+        if !Arc::ptr_eq(&self.state, &other.state) {
+            return Err(MergeError::Foreign);
+        }
+
+        let generation = self.state.generation.load(Ordering::Acquire);
+        if self.generation != generation || other.generation != generation {
+            return Err(MergeError::Stale);
+        }
+
+        if self.init != other.init || self.end != other.end {
+            return Err(MergeError::Incompatible);
+        }
+
+        // Union of both remaining regions; both share `end` and their
+        // positions lie within `[init, end]`, so this is a contiguous
+        // sub-slice of the forked range. Slicing is O(1) and copies nothing.
+        let start = cmp::min(self.pos, other.pos);
+        let offset = start - self.init;
+        let merged = self.bytes.slice(offset..);
+
+        // Retire both cursors; they remain readable but cannot merge again.
+        self.state.generation.fetch_add(1, Ordering::AcqRel);
+
+        Ok(merged)
+    }
+}
+
+impl Buf for BytesCursor {
+    #[inline]
+    fn remaining(&self) -> usize {
+        self.end - self.pos
+    }
+
+    #[inline]
+    fn chunk(&self) -> &[u8] {
+        // `pos` always stays within the `[init, end)` range kept alive by
+        // `self.bytes`, so the slice is valid.
+        unsafe { slice::from_raw_parts(self.pos as *const u8, self.end - self.pos) }
+    }
+
+    #[inline]
+    fn advance(&mut self, cnt: usize) {
+        assert!(
+            cnt <= self.remaining(),
+            "cannot advance past `remaining`: {:?} <= {:?}",
+            cnt,
+            self.remaining(),
+        );
+
+        self.pos += cnt;
     }
 }
 
