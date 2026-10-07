@@ -1,3 +1,8 @@
+# Unreleased
+
+### Added
+- Add `BufMut::try_limit()` adapter and `TryPutError` for fallible, capacity-limited writes that never partially advance the cursor
+
 # 1.12.1 (July 8th, 2026)
 
 ### Fixed

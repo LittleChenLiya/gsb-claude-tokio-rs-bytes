@@ -22,6 +22,7 @@ mod limit;
 #[cfg(feature = "std")]
 mod reader;
 mod take;
+mod try_limit;
 mod uninit_slice;
 mod vec_deque;
 #[cfg(feature = "std")]
@@ -33,6 +34,7 @@ pub use self::chain::Chain;
 pub use self::iter::IntoIter;
 pub use self::limit::Limit;
 pub use self::take::Take;
+pub use self::try_limit::TryLimit;
 pub use self::uninit_slice::UninitSlice;
 
 #[cfg(feature = "std")]

@@ -1,4 +1,4 @@
-use crate::buf::{limit, Chain, Limit, UninitSlice};
+use crate::buf::{limit, try_limit, Chain, Limit, TryLimit, UninitSlice};
 #[cfg(feature = "std")]
 use crate::buf::{writer, Writer};
 use crate::{panic_advance, panic_does_not_fit, TryGetError};
@@ -1287,6 +1287,42 @@ pub unsafe trait BufMut {
         Self: Sized,
     {
         limit::new(self, limit)
+    }
+
+    /// Creates an adaptor which borrows `self` and can write at most `limit`
+    /// bytes to it, rejecting writes that would exceed the limit.
+    ///
+    /// Unlike [`limit`](BufMut::limit), which silently truncates writes, the
+    /// returned adapter provides
+    /// [`try_put_slice`](crate::buf::TryLimit::try_put_slice), which fails
+    /// with a [`TryPutError`](crate::TryPutError) and leaves the cursor
+    /// untouched when a single write does not fit within the remaining
+    /// limit.
+    ///
+    /// The adaptor borrows the underlying buffer, so once it is dropped the
+    /// buffer can be used (and written to) again.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bytes::{BytesMut, BufMut};
+    ///
+    /// let mut buf = BytesMut::with_capacity(64);
+    /// {
+    ///     let mut dst = buf.try_limit(4);
+    ///     dst.try_put_slice(b"ab").unwrap();
+    ///     dst.try_put_slice(b"cd").unwrap();
+    ///     assert!(dst.try_put_slice(b"e").is_err());
+    /// }
+    /// buf.put_slice(b"ef");
+    /// assert_eq!(&buf[..], b"abcdef");
+    /// ```
+    #[inline]
+    fn try_limit(&mut self, limit: usize) -> TryLimit<'_, Self>
+    where
+        Self: Sized,
+    {
+        try_limit::new(self, limit)
     }
 
     /// Creates an adaptor which implements the `Write` trait for `self`.

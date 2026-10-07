@@ -201,6 +201,40 @@ impl From<TryGetError> for std::io::Error {
     }
 }
 
+/// Error type for the fallible write methods of [`buf::TryLimit`].
+/// Indicates that a write would exceed the number of bytes that
+/// may still be written to the buffer. The write is rejected as a
+/// whole: no bytes are written and the cursor is not advanced.
+#[derive(Debug, PartialEq, Eq)]
+pub struct TryPutError {
+    /// The number of bytes necessary to write the value
+    pub requested: usize,
+
+    /// The number of bytes that may still be written to the buffer
+    pub available: usize,
+}
+
+impl core::fmt::Display for TryPutError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> Result<(), core::fmt::Error> {
+        write!(
+            f,
+            "Not enough space remaining in buffer to write value (requested {} but only {} available)",
+            self.requested,
+            self.available
+        )
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for TryPutError {}
+
+#[cfg(feature = "std")]
+impl From<TryPutError> for std::io::Error {
+    fn from(error: TryPutError) -> Self {
+        std::io::Error::new(std::io::ErrorKind::WriteZero, error)
+    }
+}
+
 /// Panic with a nice error message.
 #[cold]
 fn panic_advance(error_info: &TryGetError) -> ! {
